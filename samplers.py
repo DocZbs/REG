@@ -95,9 +95,16 @@ def euler_maruyama_sampler(
             cls_deps = cls_eps_i * torch.sqrt(torch.abs(dt))
 
             # compute drift
-            v_cur, _, cls_v_cur = model(
-                model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs, cls_token=cls_model_input.to(dtype=_dtype)
-                )
+            outputs = model(
+                model_input.to(dtype=_dtype),
+                time_input.to(dtype=_dtype),
+                **kwargs,
+                cls_token=cls_model_input.to(dtype=_dtype)
+            )
+            if isinstance(outputs, (list, tuple)) and len(outputs) == 4:
+                v_cur, _, cls_v_cur, _ = outputs
+            else:
+                v_cur, _, cls_v_cur = outputs
             v_cur = v_cur.to(torch.float64)
             cls_v_cur = cls_v_cur.to(torch.float64)
 
@@ -132,16 +139,23 @@ def euler_maruyama_sampler(
     else:
         model_input = x_cur
         cls_model_input = cls_x_cur
-        y_cur = y            
+        y_cur = y
     kwargs = dict(y=y_cur)
     time_input = torch.ones(model_input.size(0)).to(
         device=device, dtype=torch.float64
         ) * t_cur
-    
+
     # compute drift
-    v_cur, _, cls_v_cur = model(
-        model_input.to(dtype=_dtype), time_input.to(dtype=_dtype), **kwargs, cls_token=cls_model_input.to(dtype=_dtype)
-        )
+    outputs = model(
+        model_input.to(dtype=_dtype),
+        time_input.to(dtype=_dtype),
+        **kwargs,
+        cls_token=cls_model_input.to(dtype=_dtype)
+    )
+    if isinstance(outputs, (list, tuple)) and len(outputs) == 4:
+        v_cur, _, cls_v_cur, _ = outputs
+    else:
+        v_cur, _, cls_v_cur = outputs
     v_cur = v_cur.to(torch.float64)
     cls_v_cur = cls_v_cur.to(torch.float64)
 

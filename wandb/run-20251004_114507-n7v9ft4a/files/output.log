@@ -1,0 +1,8 @@
+
+Steps:   0%|                                                                                    | 0/1000000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/mnt/eb20f54b-f016-4501-a5b2-5dd6afff9d90/zbs/REG/train.py", line 460, in <module>
+    main(args)
+  File "/mnt/eb20f54b-f016-4501-a5b2-5dd6afff9d90/zbs/REG/train.py", line 305, in main
+    drop_siglip = torch.rand(siglip_z.shape[0], device=device) < args.siglip_drop_prob
+                                                                 ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Namespace' object has no attribute 'siglip_drop_prob'

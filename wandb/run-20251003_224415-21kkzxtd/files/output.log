@@ -1,0 +1,11 @@
+
+Steps:   0%|                                                                                    | 0/1000000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/mnt/eb20f54b-f016-4501-a5b2-5dd6afff9d90/zbs/REG/train.py", line 467, in <module>
+    main(args)
+  File "/mnt/eb20f54b-f016-4501-a5b2-5dd6afff9d90/zbs/REG/train.py", line 320, in main
+    loss1, proj_loss1, time_input, noises, loss2, deep_loss = loss_fn(
+                                                              ^^^^^^^^
+  File "/mnt/eb20f54b-f016-4501-a5b2-5dd6afff9d90/zbs/REG/loss.py", line 141, in __call__
+    proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+                             ~~~~^~~~~~~~~~~
+RuntimeError: The size of tensor a (257) must match the size of tensor b (65) at non-singleton dimension 0

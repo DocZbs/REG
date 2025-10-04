@@ -19,7 +19,8 @@ class CustomDataset(Dataset):
         supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
 
         self.images_dir = os.path.join(data_dir, 'imagenet_256_vae')
-        self.features_dir = os.path.join(data_dir, 'vae-sd')
+        self.features_dir = os.path.join(data_dir, 'vae-sd-256')
+        self.siglip_dir = os.path.join(data_dir, 'imagenet_siglip')
 
         # images
         self._image_fnames = {
@@ -37,6 +38,15 @@ class CustomDataset(Dataset):
         self.feature_fnames = sorted(
             fname for fname in self._feature_fnames if self._file_ext(fname) in supported_ext
             )
+        # siglip_feature
+        self._siglip_fnames = {
+            os.path.relpath(os.path.join(root,fname), start=self.siglip_dir)
+            for root, _dirs, files in os.walk(self.siglip_dir) for fname in files
+        }
+
+        self.siglip_fnames = sorted(
+             fname for fname in self._siglip_fnames if self._file_ext(fname) in supported_ext
+        )
 
         # labels
         fname = os.path.join(self.features_dir, 'dataset.json')
@@ -64,6 +74,7 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         image_fname = self.image_fnames[idx]
         feature_fname = self.feature_fnames[idx]
+        siglip_fname = self.siglip_fnames[idx]
         image_ext = self._file_ext(image_fname)
         with open(os.path.join(self.images_dir, image_fname), 'rb') as f:
             if image_ext == '.npy':
@@ -77,4 +88,5 @@ class CustomDataset(Dataset):
                 image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
 
         features = np.load(os.path.join(self.features_dir, feature_fname))
-        return torch.from_numpy(image), torch.from_numpy(features), torch.tensor(self.labels[idx])
+        siglip_features =  np.load(os.path.join(self.siglip_dir, siglip_fname))
+        return torch.from_numpy(image), torch.from_numpy(features),torch.from_numpy(siglip_features), torch.tensor(self.labels[idx])

@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+import torch.nn as nn
+
 
 def mean_flat(x):
     """
@@ -13,6 +15,20 @@ def sum_flat(x):
     Take the mean over all non-batch dimensions.
     """
     return torch.sum(x, dim=list(range(1, len(x.size()))))
+class LearnableDownsample(nn.Module):
+    def __init__(self, channels, factor):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, 
+                      stride=1, padding=1, groups=channels),  # depthwise
+            nn.Conv2d(channels, channels, kernel_size=factor, 
+                      stride=factor, padding=0),  # pointwise + downsample
+            nn.GroupNorm(32, channels)
+        )
+    
+    def forward(self, x):
+        return self.conv(x)
+
 
 class SILoss:
     def __init__(
@@ -24,6 +40,8 @@ class SILoss:
             accelerator=None, 
             latents_scale=None, 
             latents_bias=None,
+            # deep_supervision_type='cos',
+            # deep_supervision_factor=2
             ):
         self.prediction = prediction
         self.weighting = weighting
@@ -32,7 +50,9 @@ class SILoss:
         self.accelerator = accelerator
         self.latents_scale = latents_scale
         self.latents_bias = latents_bias
-
+        # self.deep_supervision_type = deep_supervision_type
+        
+        # self.learnable_downsample = LearnableDownsample(channels, factor)
     def interpolant(self, t):
         if self.path_type == "linear":
             alpha_t = 1 - t
@@ -49,8 +69,8 @@ class SILoss:
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def __call__(self, model, images, model_kwargs=None, zs=None, cls_token=None,
-                 time_input=None, noises=None,):
+    def __call__(self, model, images, model_kwargs=None, cls_token=None,
+                 time_input=None, noises=None):
         if model_kwargs == None:
             model_kwargs = {}
         # sample timesteps
@@ -65,7 +85,7 @@ class SILoss:
                     time_input = sigma / (1 + sigma)
                 elif self.path_type == "cosine":
                     time_input = 2 / np.pi * torch.atan(sigma)
-                
+
         time_input = time_input.to(device=images.device, dtype=images.dtype)
 
         if noises is None:
@@ -82,21 +102,19 @@ class SILoss:
         else:
             raise NotImplementedError()
 
-        model_output, zs_tilde, cls_output = model(model_input, time_input.flatten(), **model_kwargs,
-                                                    cls_token=cls_input)
+        outputs = model(
+            model_input,
+            time_input.flatten(),
+            **model_kwargs,
+            cls_token=cls_input,
+        )
+
+        model_output, zs_tilde, cls_output = outputs
+        deep_pred = None
 
         #denoising_loss
         denoising_loss = mean_flat((model_output - model_target) ** 2)
         denoising_loss_cls = mean_flat((cls_output - cls_target) ** 2)
 
-        # projection loss
-        proj_loss = 0.
-        bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-            for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-        proj_loss /= (len(zs) * bsz)
 
-        return denoising_loss, proj_loss, time_input, noises, denoising_loss_cls
+        return denoising_loss, denoising_loss_cls

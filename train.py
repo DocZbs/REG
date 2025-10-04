@@ -163,14 +163,15 @@ def main(args):
             )
     else:
         raise NotImplementedError()
-    z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
+    # z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
         use_cfg = (args.cfg_prob > 0),
-        z_dims = z_dims,
+        # z_dims = z_dims,
         encoder_depth=args.encoder_depth,
+        siglip_dim=args.siglip_dim,
         **block_kwargs
     )
 
@@ -189,11 +190,12 @@ def main(args):
     loss_fn = SILoss(
         prediction=args.prediction,
         path_type=args.path_type, 
-        encoders=encoders,
         accelerator=accelerator,
         latents_scale=latents_scale,
         latents_bias=latents_bias,
-        weighting=args.weighting
+        weighting=args.weighting,
+        # deep_supervision_weight=args.deep_supervision_weight
+        # deep_supervision_type=args.deep_supervision_type,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -268,7 +270,7 @@ def main(args):
 
     # Labels to condition the model with (feel free to change):
     sample_batch_size = 64 // accelerator.num_processes
-    gt_raw_images, gt_xs, _ = next(iter(train_dataloader))
+    gt_raw_images, gt_xs, gt_siglips, _ = next(iter(train_dataloader))
     assert gt_raw_images.shape[-1] == args.resolution
     gt_xs = gt_xs[:sample_batch_size]
     gt_xs = sample_posterior(
@@ -282,14 +284,15 @@ def main(args):
         
     for epoch in range(args.epochs):
         model.train()
-        for raw_image, x, y in train_dataloader:
-            raw_image = raw_image.to(device)
+        for raw_image, x, siglip_z, y in train_dataloader:
+            # raw_image = raw_image.to(device)
             x = x.squeeze(dim=1).to(device)
+            siglip_z = siglip_z.to(device)
             y = y.to(device)
             z = None
             if args.legacy:
-                # In our early experiments, we accidentally apply label dropping twice: 
-                # once in train.py and once in sit.py. 
+                # In our early experiments, we accidentally apply label dropping twice:
+                # once in train.py and once in sit.py.
                 # We keep this option for exact reproducibility with previous runs.
                 drop_ids = torch.rand(y.shape[0], device=y.device) < args.cfg_prob
                 labels = torch.where(drop_ids, args.num_classes, y)
@@ -297,28 +300,32 @@ def main(args):
                 labels = y
             with torch.no_grad():
                 x = sample_posterior(x, latents_scale=latents_scale, latents_bias=latents_bias)
-                zs = []
-                with accelerator.autocast():
-                    for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
-                        raw_image_ = preprocess_raw_image(raw_image, encoder_type)
-                        z = encoder.forward_features(raw_image_)
-                        if 'dinov2' in encoder_type:
-                            dense_z = z['x_norm_patchtokens']
-                            cls_token = z['x_norm_clstoken']
-                            dense_z = torch.cat([cls_token.unsqueeze(1), dense_z], dim=1)
-                        else:
-                            exit()
-                        zs.append(dense_z)
+
+                # SigLIP feature dropout for classifier-free guidance
+                drop_siglip = torch.rand(siglip_z.shape[0], device=device) < args.siglip_drop_prob
+                siglip_z_cond = torch.where(
+                    drop_siglip.unsqueeze(1),
+                    torch.zeros_like(siglip_z),
+                    siglip_z
+                )
+
+                # SigLIP only supervises cls_token denoising
+                cls_token = siglip_z_cond  # [B, D] - SigLIP saves pooled output only
 
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
-                loss1, proj_loss1, time_input, noises, loss2 = loss_fn(model, x, model_kwargs, zs=zs,
-                                                                       cls_token=cls_token,
-                                                                       time_input=None, noises=None)
-                loss_mean = loss1.mean()
-                loss_mean_cls = loss2.mean() * args.cls
-                proj_loss_mean = proj_loss1.mean() * args.proj_coeff
-                loss = loss_mean + proj_loss_mean + loss_mean_cls
+                loss_mean, loss_mean_cls = loss_fn(
+                    model,
+                    x,
+                    model_kwargs,
+                    cls_token=cls_token,
+                    time_input=None,
+                    noises=None
+                )
+                loss_mean = loss_mean.mean()
+                loss_mean_cls = loss_mean_cls.mean() * args.cls
+                # SigLIP only supervises cls denoising
+                loss = loss_mean + loss_mean_cls
 
 
                 ## optimization
@@ -355,7 +362,6 @@ def main(args):
             logs = {
                 "loss_final": accelerator.gather(loss).mean().detach().item(),
                 "loss_mean": accelerator.gather(loss_mean).mean().detach().item(),
-                "proj_loss": accelerator.gather(proj_loss_mean).mean().detach().item(),
                 "loss_mean_cls": accelerator.gather(loss_mean_cls).mean().detach().item(),
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
             }
@@ -397,6 +403,15 @@ def parse_args(input_args=None):
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ops-head", type=int, default=16)
+    parser.add_argument("--siglip-drop-prob", type=float, default=0.1, help="Probability of dropping SigLIP features during training for CFG")
+    parser.add_argument("--siglip-dim", type=int, default=1152, help="Dimension of SigLIP features")
+    # parser.add_argument("--deep-supervision-layer", type=int, default=None,
+    #                     help="1-based index of transformer block to apply deep supervision; disabled if unset")
+    # parser.add_argument("--deep-supervision-factor", type=int, default=2,
+    #                     help="Downsampling factor applied to the intermediate velocity prediction")
+    # parser.add_argument("--deep-supervision-weight", type=float, default=0.0,
+    #                     help="Loss weight for intermediate deep supervision term")
+    # parser.add_argument("--deep-supervision-type", type=str, default="mse", choices=["mse", "cos"])
 
     # dataset
     parser.add_argument("--data-dir", type=str, default="../data/imagenet256")

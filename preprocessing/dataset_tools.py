@@ -382,39 +382,74 @@ def convert(
 @click.option('--source',     help='Input directory or archive name', metavar='PATH',   type=str, required=True)
 @click.option('--dest',       help='Output directory or archive name', metavar='PATH',  type=str, required=True)
 @click.option('--max-images', help='Maximum number of images to output', metavar='INT', type=int)
+@click.option('--batch-size', help='Batch size for VAE encoding', metavar='INT',        type=int, default=256, show_default=True)
 
 def encode(
     model_url: str,
     source: str,
     dest: str,
     max_images: Optional[int],
+    batch_size: int,
 ):
-    """Encode pixel data to VAE latents."""
+    """Encode pixel data to VAE latents using CUDA batch processing."""
     PIL.Image.init()
     if dest == '':
         raise click.ClickException('--dest output filename or directory must not be an empty string')
 
-    vae = StabilityVAEEncoder(vae_name=model_url, batch_size=1)
-    print("VAE is over!!!")
+    # Check CUDA availability
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        print("WARNING: CUDA not available, using CPU (will be slower)")
+
+    # Initialize VAE with batch processing capability
+    vae = StabilityVAEEncoder(vae_name=model_url, batch_size=batch_size)
+    print(f"VAE initialized on {device} with batch size {batch_size}")
+
     num_files, input_iter = open_dataset(source, max_images=max_images)
     archive_root_dir, save_bytes, close_dest = open_dest(dest)
-    print("Data is over!!!")
-    labels = []
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    for idx, image in tqdm(enumerate(input_iter), total=num_files):
-        img_tensor = torch.tensor(image.img).to('cuda').permute(2, 0, 1).unsqueeze(0)
-        mean_std = vae.encode_pixels(img_tensor)[0].cpu()
-        idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img-mean-std-{idx_str}.npy'
+    print(f"Processing {num_files} images...")
 
-        f = io.BytesIO()
-        np.save(f, mean_std)
-        save_bytes(os.path.join(archive_root_dir, archive_fname), f.getvalue())
-        labels.append([archive_fname, image.label] if image.label is not None else None)
+    labels = []
+    batch_images = []
+    batch_metadata = []
+
+    # Process images in batches
+    with tqdm(total=num_files, desc="Encoding images") as pbar:
+        for idx, image in enumerate(input_iter):
+            # Accumulate batch
+            img_tensor = torch.tensor(image.img).permute(2, 0, 1)  # HWC -> CHW
+            batch_images.append(img_tensor)
+
+            idx_str = f'{idx:08d}'
+            archive_fname = f'{idx_str[:5]}/img-mean-std-{idx_str}.npy'
+            batch_metadata.append((archive_fname, image.label))
+
+            # Process batch when full or at end
+            if len(batch_images) == batch_size or idx == num_files - 1:
+                # Stack and move to device
+                batch_tensor = torch.stack(batch_images).to(device)
+
+                # Encode batch
+                with torch.no_grad():
+                    mean_std_batch = vae.encode_pixels(batch_tensor).cpu()
+
+                # Save individual latents
+                for i, (fname, label) in enumerate(batch_metadata):
+                    mean_std = mean_std_batch[i]
+                    f = io.BytesIO()
+                    np.save(f, mean_std.numpy())
+                    save_bytes(os.path.join(archive_root_dir, fname), f.getvalue())
+                    labels.append([fname, label] if label is not None else None)
+
+                # Clear batch
+                batch_images = []
+                batch_metadata = []
+                pbar.update(len(batch_metadata) if idx == num_files - 1 else batch_size)
 
     metadata = {'labels': labels if all(x is not None for x in labels) else None}
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
+    print("Encoding completed successfully!")
 
 if __name__ == "__main__":
     cmdline()

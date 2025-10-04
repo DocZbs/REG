@@ -8,6 +8,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -162,6 +163,24 @@ class FinalLayer(nn.Module):
             x = self.linear(x[:, 1:])
             return x, cls_token.squeeze(1)
 
+# class DeepSupervisionLayerAlign(nn.Module):
+#     """
+#     The align layer of SiT.
+#     """
+#     def __init__(self, hidden_size, patch_size, out_channels):
+#         super().__init__()
+#         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+#         self.mlp = Mlp(
+#             in_features=hidden_size, hidden_features=hidden_size, act_layer=nn.SiLU(), bias=True
+#             )
+#         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+
+    
+#     def forward(self, x):
+#         x = self.mlp(self.norm(x))
+#         return self.linear(x)
+
+
 
 class SiT(nn.Module):
     """
@@ -185,6 +204,9 @@ class SiT(nn.Module):
         z_dims=[768],
         projector_dim=2048,
         cls_token_dim=768,
+        deep_supervision_layer=None,
+        deep_supervision_factor=2,
+        siglip_dim=1152,  # SigLIP feature dimension
         **block_kwargs # fused_attn
     ):
         super().__init__()
@@ -197,6 +219,8 @@ class SiT(nn.Module):
         self.num_classes = num_classes
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
+        self.deep_supervision_index = deep_supervision_layer
+        self.deep_supervision_factor = deep_supervision_factor
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -214,13 +238,15 @@ class SiT(nn.Module):
             build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims
             ])
 
-        z_dim = self.z_dims[0]
-        cls_token_dim = z_dim
+        # Use siglip_dim for cls_token projection instead of z_dims
+        cls_token_dim = siglip_dim
         self.final_layer = FinalLayer(decoder_hidden_size, patch_size, self.out_channels, cls_token_dim)
+
 
 
         self.cls_projectors2 = nn.Linear(in_features=cls_token_dim, out_features=hidden_size, bias=True)
         self.wg_norm = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
+
 
         self.initialize_weights()
 
@@ -264,6 +290,7 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer.linear_cls.weight, 0)
         nn.init.constant_(self.final_layer.linear_cls.bias, 0)
 
+
     def unpatchify(self, x, patch_size=None):
         """
         x: (N, T, patch_size**2 * C)
@@ -304,14 +331,19 @@ class SiT(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t_embed + y
 
+        # Note: siglip_emb removed to avoid train/test mismatch
+        # SigLIP only supervises through cls_token denoising
+
+        deep_pred = None
         for i, block in enumerate(self.blocks):
             x = block(x, c)
-            if (i + 1) == self.encoder_depth:
-                zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
-
+            # if (i + 1) == self.encoder_depth:
+            #     zs = [projector(x.reshape(-1, D)).reshape(N, T, -1) for projector in self.projectors]
         x, cls_token = self.final_layer(x, c, cls=cls_token)
         x = self.unpatchify(x)
 
+        # Return dummy zs for compatibility with loss function
+        zs = None
         return x, zs, cls_token
 
 
@@ -417,4 +449,3 @@ SiT_models = {
     'SiT-B/2':  SiT_B_2,   'SiT-B/4':  SiT_B_4,   'SiT-B/8':  SiT_B_8,
     'SiT-S/2':  SiT_S_2,   'SiT-S/4':  SiT_S_4,   'SiT-S/8':  SiT_S_8,
 }
-
