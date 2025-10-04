@@ -1,2 +1,4 @@
 wandb/
 your_path/
+*.log
+*.json
