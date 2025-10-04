@@ -89,6 +89,42 @@ def open_image_folder(source_dir, *, max_images: Optional[int]) -> tuple[int, It
                 break
     return max_idx, iterate_images()
 
+def collect_image_paths(source_dir, *, max_images: Optional[int]) -> list:
+    """Collect image paths and labels without loading images."""
+    input_images = []
+    def _recurse_dirs(root: str):
+        with os.scandir(root) as it:
+            for e in it:
+                if e.is_file():
+                    input_images.append(os.path.join(root, e.name))
+                elif e.is_dir():
+                    _recurse_dirs(os.path.join(root, e.name))
+    _recurse_dirs(source_dir)
+    input_images = sorted([f for f in input_images if is_image_ext(f)])
+
+    arch_fnames = {fname: os.path.relpath(fname, source_dir).replace('\\', '/') for fname in input_images}
+    max_idx = maybe_min(len(input_images), max_images)
+
+    labels = dict()
+    meta_fname = os.path.join(source_dir, 'dataset.json')
+    if os.path.isfile(meta_fname):
+        with open(meta_fname, 'r') as file:
+            data = json.load(file)['labels']
+            if data is not None:
+                labels = {x[0]: x[1] for x in data}
+
+    if len(labels) == 0:
+        toplevel_names = {arch_fname: arch_fname.split('/')[0] if '/' in arch_fname else '' for arch_fname in arch_fnames.values()}
+        toplevel_indices = {toplevel_name: idx for idx, toplevel_name in enumerate(sorted(set(toplevel_names.values())))}
+        if len(toplevel_indices) > 1:
+            labels = {arch_fname: toplevel_indices[toplevel_name] for arch_fname, toplevel_name in toplevel_names.items()}
+
+    image_path_list = []
+    for idx, fname in enumerate(input_images[:max_idx]):
+        image_path_list.append((fname, labels.get(arch_fnames[fname]), idx))
+
+    return image_path_list
+
 def open_image_zip(source, *, max_images: Optional[int]) -> tuple[int, Iterator[ImageEntry]]:
     with zipfile.ZipFile(source, mode='r') as z:
         input_images = [str(f) for f in sorted(z.namelist()) if is_image_ext(f)]
@@ -160,17 +196,23 @@ def preprocess_image_for_siglip(img: np.ndarray, processor) -> torch.Tensor:
     return inputs['pixel_values']
 
 class ImageDataset(Dataset):
-    def __init__(self, image_list, processor):
-        self.image_list = image_list
+    def __init__(self, image_paths, processor):
+        """
+        Args:
+            image_paths: List of tuples (image_path, label, global_idx)
+            processor: SigLIP processor
+        """
+        self.image_paths = image_paths
         self.processor = processor
 
     def __len__(self):
-        return len(self.image_list)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        entry, global_idx = self.image_list[idx]
-        pixel_values = preprocess_image_for_siglip(entry.img, self.processor)
-        return pixel_values.squeeze(0), entry.label, global_idx
+        img_path, label, global_idx = self.image_paths[idx]
+        img = np.array(PIL.Image.open(img_path).convert('RGB'))
+        pixel_values = preprocess_image_for_siglip(img, self.processor)
+        return pixel_values.squeeze(0), label if label is not None else -1, global_idx
 
 @click.command()
 @click.option('--source', help='Input directory or archive name', metavar='PATH', type=str, required=True)
@@ -204,25 +246,27 @@ def encode(
 
     model, processor = load_siglip_model(model_name, device)
 
-    # Load all images into memory first (only on main process)
+    # Collect image paths (only on main process)
     if accelerator.is_main_process:
-        num_files, input_iter = open_dataset(source, max_images=max_images)
-        image_list = [(entry, idx) for idx, entry in enumerate(input_iter)]
-        print(f"Loaded {len(image_list)} images")
+        if os.path.isdir(source):
+            image_path_list = collect_image_paths(source, max_images=max_images)
+        else:
+            raise click.ClickException('Only directory input is supported for multi-GPU processing')
+        print(f"Found {len(image_path_list)} images")
     else:
-        image_list = None
+        image_path_list = None
 
-    # Broadcast image list to all processes
+    # Broadcast image path list to all processes
     from accelerate.utils import broadcast_object_list
     if accelerator.is_main_process:
-        obj_list = [image_list]
+        obj_list = [image_path_list]
     else:
         obj_list = [None]
     broadcast_object_list(obj_list, from_process=0)
-    image_list = obj_list[0]
+    image_path_list = obj_list[0]
 
     # Create dataset and dataloader
-    dataset = ImageDataset(image_list, processor)
+    dataset = ImageDataset(image_path_list, processor)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     # Prepare with accelerator
