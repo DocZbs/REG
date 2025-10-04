@@ -23,6 +23,8 @@ import PIL.Image
 import torch
 from tqdm import tqdm
 from torchvision.transforms import Normalize, Compose, Resize, CenterCrop, ToTensor
+from accelerate import Accelerator
+from torch.utils.data import Dataset, DataLoader
 
 SIGLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
 SIGLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -157,76 +159,136 @@ def preprocess_image_for_siglip(img: np.ndarray, processor) -> torch.Tensor:
     inputs = processor(images=pil_img, return_tensors="pt")
     return inputs['pixel_values']
 
+class ImageDataset(Dataset):
+    def __init__(self, image_list, processor):
+        self.image_list = image_list
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        entry, global_idx = self.image_list[idx]
+        pixel_values = preprocess_image_for_siglip(entry.img, self.processor)
+        return pixel_values.squeeze(0), entry.label, global_idx
+
 @click.command()
 @click.option('--source', help='Input directory or archive name', metavar='PATH', type=str, required=True)
 @click.option('--dest', help='Output directory or archive name', metavar='PATH', type=str, required=True)
 @click.option('--max-images', help='Maximum number of images to output', metavar='INT', type=int)
 @click.option('--model-name', help='SigLIP model name from HuggingFace', metavar='STR', type=str, default='google/siglip-so400m-patch14-384')
-@click.option('--batch-size', help='Batch size for encoding', metavar='INT', type=int, default=32)
+@click.option('--batch-size', help='Batch size per GPU for encoding', metavar='INT', type=int, default=32)
+@click.option('--save-patch-tokens', help='Save patch tokens (vision_outputs[0])', is_flag=True, default=False)
 def encode(
     source: str,
     dest: str,
     max_images: Optional[int],
     model_name: str,
-    batch_size: int
+    batch_size: int,
+    save_patch_tokens: bool
 ):
-    """Encode images using SigLIP model."""
-    
+    """Encode images using SigLIP model with multi-GPU support via Accelerate."""
+
     PIL.Image.init()
     if dest == '':
         raise click.ClickException('--dest output filename or directory must not be an empty string')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading SigLIP model: {model_name}")
+    # Initialize Accelerator
+    accelerator = Accelerator()
+    device = accelerator.device
+
+    if accelerator.is_main_process:
+        print(f"Loading SigLIP model: {model_name}")
+        print(f"Number of processes: {accelerator.num_processes}")
+        print(f"Save patch tokens: {save_patch_tokens}")
+
     model, processor = load_siglip_model(model_name, device)
-    print("Model loaded successfully!")
 
-    num_files, input_iter = open_dataset(source, max_images=max_images)
-    archive_root_dir, save_bytes, close_dest = open_dest(dest)
-    print(f"Processing {num_files} images...")
+    # Load all images into memory first (only on main process)
+    if accelerator.is_main_process:
+        num_files, input_iter = open_dataset(source, max_images=max_images)
+        image_list = [(entry, idx) for idx, entry in enumerate(input_iter)]
+        print(f"Loaded {len(image_list)} images")
+    else:
+        image_list = None
 
-    labels = []
-    image_batch = []
-    image_entries = []
-    idx_batch = []
+    # Broadcast image list to all processes
+    from accelerate.utils import broadcast_object_list
+    if accelerator.is_main_process:
+        obj_list = [image_list]
+    else:
+        obj_list = [None]
+    broadcast_object_list(obj_list, from_process=0)
+    image_list = obj_list[0]
 
-    def process_batch(batch_images, batch_entries, batch_indices):
+    # Create dataset and dataloader
+    dataset = ImageDataset(image_list, processor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # Prepare with accelerator
+    model, dataloader = accelerator.prepare(model, dataloader)
+
+    # Only main process handles file writing
+    if accelerator.is_main_process:
+        archive_root_dir, save_bytes, close_dest = open_dest(dest)
+        labels = []
+
+    # Process batches
+    all_results = []
+    for pixel_values, label_batch, idx_batch in tqdm(dataloader, disable=not accelerator.is_main_process):
         with torch.no_grad():
-            pixel_values = torch.cat(batch_images, dim=0).to(device)
-            vision_outputs = model.vision_model(pixel_values=pixel_values)
-            image_embeds = vision_outputs[1]
-            image_embeds = model.vision_model.post_layernorm(image_embeds)
-            
-            for i, (feature, entry, idx) in enumerate(zip(image_embeds, batch_entries, batch_indices)):
-                feature_np = feature.cpu().numpy()
-                idx_str = f'{idx:08d}'
-                archive_fname = f'{idx_str[:5]}/img-feature-{idx_str}.npy'
+            vision_outputs = model.module.vision_model(pixel_values=pixel_values)
 
+            # Extract both outputs
+            patch_tokens = vision_outputs[0]  # [B, num_patches, hidden_dim]
+            pooled_output = vision_outputs[1]  # [B, hidden_dim]
+            pooled_output = model.module.vision_model.post_layernorm(pooled_output)
+
+            # Gather results from all processes
+            patch_tokens_gathered = accelerator.gather(patch_tokens)
+            pooled_output_gathered = accelerator.gather(pooled_output)
+            label_gathered = accelerator.gather(label_batch)
+            idx_gathered = accelerator.gather(idx_batch)
+
+            # Store results
+            if accelerator.is_main_process:
+                for i in range(len(idx_gathered)):
+                    all_results.append({
+                        'patch_tokens': patch_tokens_gathered[i].cpu().numpy() if save_patch_tokens else None,
+                        'pooled_output': pooled_output_gathered[i].cpu().numpy(),
+                        'label': label_gathered[i].item() if label_gathered[i] != -1 else None,
+                        'idx': idx_gathered[i].item()
+                    })
+
+    # Save results (only main process)
+    if accelerator.is_main_process:
+        print(f"Saving {len(all_results)} features...")
+        for result in tqdm(all_results):
+            idx = result['idx']
+            idx_str = f'{idx:08d}'
+
+            # Save pooled output
+            pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
+            f = io.BytesIO()
+            np.save(f, result['pooled_output'])
+            save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+
+            # Save patch tokens if requested
+            if save_patch_tokens and result['patch_tokens'] is not None:
+                patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
                 f = io.BytesIO()
-                np.save(f, feature_np)
-                save_bytes(os.path.join(archive_root_dir, archive_fname), f.getvalue())
-                labels.append([archive_fname, entry.label] if entry.label is not None else None)
+                np.save(f, result['patch_tokens'])
+                save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
 
-    for idx, image_entry in tqdm(enumerate(input_iter), total=num_files):
-        pixel_values = preprocess_image_for_siglip(image_entry.img, processor)
-        image_batch.append(pixel_values)
-        image_entries.append(image_entry)
-        idx_batch.append(idx)
+            labels.append([pooled_fname, result['label']] if result['label'] is not None else None)
 
-        if len(image_batch) >= batch_size:
-            process_batch(image_batch, image_entries, idx_batch)
-            image_batch = []
-            image_entries = []
-            idx_batch = []
+        metadata = {'labels': labels if all(x is not None for x in labels) else None}
+        save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
+        close_dest()
 
-    if len(image_batch) > 0:
-        process_batch(image_batch, image_entries, idx_batch)
+        print(f"Encoding completed! Output saved to {dest}")
 
-    metadata = {'labels': labels if all(x is not None for x in labels) else None}
-    save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
-    close_dest()
-    
-    print(f"Encoding completed! Output saved to {dest}")
+    accelerator.wait_for_everyone()
 
 if __name__ == "__main__":
     encode()
