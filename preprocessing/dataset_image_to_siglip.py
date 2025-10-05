@@ -265,9 +265,9 @@ def encode(
     broadcast_object_list(obj_list, from_process=0)
     image_path_list = obj_list[0]
 
-    # Create dataset and dataloader
+    # Create dataset and dataloader (reduce num_workers to save memory)
     dataset = ImageDataset(image_path_list, processor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     # Prepare with accelerator
     model, dataloader = accelerator.prepare(model, dataloader)
@@ -277,8 +277,7 @@ def encode(
         archive_root_dir, save_bytes, close_dest = open_dest(dest)
         labels = []
 
-    # Process batches
-    all_results = []
+    # Process batches with immediate saving to avoid OOM
     for pixel_values, label_batch, idx_batch in tqdm(dataloader, disable=not accelerator.is_main_process):
         with torch.no_grad():
             vision_outputs = model.module.vision_model(pixel_values=pixel_values)
@@ -294,37 +293,37 @@ def encode(
             label_gathered = accelerator.gather(label_batch)
             idx_gathered = accelerator.gather(idx_batch)
 
-            # Store results
+            # Immediately save results and free memory
             if accelerator.is_main_process:
                 for i in range(len(idx_gathered)):
-                    all_results.append({
-                        'patch_tokens': patch_tokens_gathered[i].cpu().numpy() if save_patch_tokens else None,
-                        'pooled_output': pooled_output_gathered[i].cpu().numpy(),
-                        'label': label_gathered[i].item() if label_gathered[i] != -1 else None,
-                        'idx': idx_gathered[i].item()
-                    })
+                    idx = idx_gathered[i].item()
+                    idx_str = f'{idx:08d}'
 
-    # Save results (only main process)
+                    # Save pooled output
+                    pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
+                    f = io.BytesIO()
+                    np.save(f, pooled_output_gathered[i].cpu().numpy())
+                    save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+
+                    # Save patch tokens if requested
+                    if save_patch_tokens:
+                        patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+                        f = io.BytesIO()
+                        np.save(f, patch_tokens_gathered[i].cpu().numpy())
+                        save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
+
+                    label = label_gathered[i].item() if label_gathered[i] != -1 else None
+                    labels.append([pooled_fname, label] if label is not None else None)
+
+                # Free memory immediately
+                del patch_tokens_gathered, pooled_output_gathered, label_gathered, idx_gathered
+
+            # Clear GPU cache
+            torch.cuda.empty_cache()
+
+    # Save metadata (only main process)
     if accelerator.is_main_process:
-        print(f"Saving {len(all_results)} features...")
-        for result in tqdm(all_results):
-            idx = result['idx']
-            idx_str = f'{idx:08d}'
-
-            # Save pooled output
-            pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
-            f = io.BytesIO()
-            np.save(f, result['pooled_output'])
-            save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
-
-            # Save patch tokens if requested
-            if save_patch_tokens and result['patch_tokens'] is not None:
-                patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
-                f = io.BytesIO()
-                np.save(f, result['patch_tokens'])
-                save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
-
-            labels.append([pooled_fname, result['label']] if result['label'] is not None else None)
+        print(f"Saving metadata for {len(labels)} features...")
 
         metadata = {'labels': labels if all(x is not None for x in labels) else None}
         save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
