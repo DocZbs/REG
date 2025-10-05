@@ -277,8 +277,11 @@ def encode(
         archive_root_dir, save_bytes, close_dest = open_dest(dest)
         labels = []
 
-    # Process batches with immediate saving to avoid OOM
-    for pixel_values, label_batch, idx_batch in tqdm(dataloader, disable=not accelerator.is_main_process):
+    # Process batches with periodic saving (batch every N iterations)
+    save_interval = 50  # Save every 50 batches to balance memory and I/O
+    batch_buffer = []
+
+    for batch_idx, (pixel_values, label_batch, idx_batch) in enumerate(tqdm(dataloader, disable=not accelerator.is_main_process)):
         with torch.no_grad():
             vision_outputs = model.module.vision_model(pixel_values=pixel_values)
 
@@ -293,33 +296,64 @@ def encode(
             label_gathered = accelerator.gather(label_batch)
             idx_gathered = accelerator.gather(idx_batch)
 
-            # Immediately save results and free memory
+            # Buffer results in main process
             if accelerator.is_main_process:
                 for i in range(len(idx_gathered)):
-                    idx = idx_gathered[i].item()
-                    idx_str = f'{idx:08d}'
+                    batch_buffer.append({
+                        'patch_tokens': patch_tokens_gathered[i].cpu().numpy() if save_patch_tokens else None,
+                        'pooled_output': pooled_output_gathered[i].cpu().numpy(),
+                        'label': label_gathered[i].item() if label_gathered[i] != -1 else None,
+                        'idx': idx_gathered[i].item()
+                    })
 
-                    # Save pooled output
-                    pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
-                    f = io.BytesIO()
-                    np.save(f, pooled_output_gathered[i].cpu().numpy())
-                    save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+                # Periodic save when buffer is full
+                if len(batch_buffer) >= save_interval * batch_size * accelerator.num_processes:
+                    for result in batch_buffer:
+                        idx = result['idx']
+                        idx_str = f'{idx:08d}'
 
-                    # Save patch tokens if requested
-                    if save_patch_tokens:
-                        patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+                        # Save pooled output
+                        pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
                         f = io.BytesIO()
-                        np.save(f, patch_tokens_gathered[i].cpu().numpy())
-                        save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
+                        np.save(f, result['pooled_output'])
+                        save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
 
-                    label = label_gathered[i].item() if label_gathered[i] != -1 else None
-                    labels.append([pooled_fname, label] if label is not None else None)
+                        # Save patch tokens if requested
+                        if save_patch_tokens and result['patch_tokens'] is not None:
+                            patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+                            f = io.BytesIO()
+                            np.save(f, result['patch_tokens'])
+                            save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
 
-                # Free memory immediately
-                del patch_tokens_gathered, pooled_output_gathered, label_gathered, idx_gathered
+                        label = result['label']
+                        labels.append([pooled_fname, label] if label is not None else None)
 
-            # Clear GPU cache
-            torch.cuda.empty_cache()
+                    batch_buffer.clear()
+                    torch.cuda.empty_cache()
+
+    # Save remaining buffered results
+    if accelerator.is_main_process and len(batch_buffer) > 0:
+        for result in batch_buffer:
+            idx = result['idx']
+            idx_str = f'{idx:08d}'
+
+            # Save pooled output
+            pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
+            f = io.BytesIO()
+            np.save(f, result['pooled_output'])
+            save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+
+            # Save patch tokens if requested
+            if save_patch_tokens and result['patch_tokens'] is not None:
+                patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+                f = io.BytesIO()
+                np.save(f, result['patch_tokens'])
+                save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
+
+            label = result['label']
+            labels.append([pooled_fname, label] if label is not None else None)
+
+        batch_buffer.clear()
 
     # Save metadata (only main process)
     if accelerator.is_main_process:
