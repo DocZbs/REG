@@ -272,12 +272,12 @@ def encode(
     # Prepare with accelerator
     model, dataloader = accelerator.prepare(model, dataloader)
 
-    # Only main process handles file writing
-    if accelerator.is_main_process:
-        archive_root_dir, save_bytes, close_dest = open_dest(dest)
-        labels = []
+    # Each process handles its own file writing independently (no gather, no NCCL timeout)
+    if not os.path.isdir(dest):
+        raise click.ClickException('--dest must be a directory for multi-GPU processing')
+    os.makedirs(dest, exist_ok=True)
 
-    # Process batches with periodic saving (batch every N iterations)
+    local_labels = []
     save_interval = 50  # Save every 50 batches to balance memory and I/O
     batch_buffer = []
 
@@ -290,78 +290,87 @@ def encode(
             pooled_output = vision_outputs[1]  # [B, hidden_dim]
             pooled_output = model.module.vision_model.post_layernorm(pooled_output)
 
-            # Gather results from all processes
-            patch_tokens_gathered = accelerator.gather(patch_tokens)
-            pooled_output_gathered = accelerator.gather(pooled_output)
-            label_gathered = accelerator.gather(label_batch)
-            idx_gathered = accelerator.gather(idx_batch)
+            # Each process saves its own batch (no gather needed!)
+            for i in range(len(idx_batch)):
+                batch_buffer.append({
+                    'patch_tokens': patch_tokens[i].cpu().numpy() if save_patch_tokens else None,
+                    'pooled_output': pooled_output[i].cpu().numpy(),
+                    'label': label_batch[i].item() if label_batch[i] != -1 else None,
+                    'idx': idx_batch[i].item()
+                })
 
-            # Buffer results in main process
-            if accelerator.is_main_process:
-                for i in range(len(idx_gathered)):
-                    batch_buffer.append({
-                        'patch_tokens': patch_tokens_gathered[i].cpu().numpy() if save_patch_tokens else None,
-                        'pooled_output': pooled_output_gathered[i].cpu().numpy(),
-                        'label': label_gathered[i].item() if label_gathered[i] != -1 else None,
-                        'idx': idx_gathered[i].item()
-                    })
+            # Periodic save when buffer is full
+            if len(batch_buffer) >= save_interval * batch_size:
+                for result in batch_buffer:
+                    idx = result['idx']
+                    idx_str = f'{idx:08d}'
 
-                # Periodic save when buffer is full
-                if len(batch_buffer) >= save_interval * batch_size * accelerator.num_processes:
-                    for result in batch_buffer:
-                        idx = result['idx']
-                        idx_str = f'{idx:08d}'
+                    # Save pooled output
+                    pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
+                    pooled_path = os.path.join(dest, pooled_fname)
+                    os.makedirs(os.path.dirname(pooled_path), exist_ok=True)
+                    np.save(pooled_path, result['pooled_output'])
 
-                        # Save pooled output
-                        pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
-                        f = io.BytesIO()
-                        np.save(f, result['pooled_output'])
-                        save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+                    # Save patch tokens if requested
+                    if save_patch_tokens and result['patch_tokens'] is not None:
+                        patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+                        patch_path = os.path.join(dest, patch_fname)
+                        os.makedirs(os.path.dirname(patch_path), exist_ok=True)
+                        np.save(patch_path, result['patch_tokens'])
 
-                        # Save patch tokens if requested
-                        if save_patch_tokens and result['patch_tokens'] is not None:
-                            patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
-                            f = io.BytesIO()
-                            np.save(f, result['patch_tokens'])
-                            save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
+                    label = result['label']
+                    local_labels.append([pooled_fname, label] if label is not None else None)
 
-                        label = result['label']
-                        labels.append([pooled_fname, label] if label is not None else None)
-
-                    batch_buffer.clear()
-                    torch.cuda.empty_cache()
+                batch_buffer.clear()
+                torch.cuda.empty_cache()
 
     # Save remaining buffered results
-    if accelerator.is_main_process and len(batch_buffer) > 0:
+    if len(batch_buffer) > 0:
         for result in batch_buffer:
             idx = result['idx']
             idx_str = f'{idx:08d}'
 
             # Save pooled output
             pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
-            f = io.BytesIO()
-            np.save(f, result['pooled_output'])
-            save_bytes(os.path.join(archive_root_dir, pooled_fname), f.getvalue())
+            pooled_path = os.path.join(dest, pooled_fname)
+            os.makedirs(os.path.dirname(pooled_path), exist_ok=True)
+            np.save(pooled_path, result['pooled_output'])
 
             # Save patch tokens if requested
             if save_patch_tokens and result['patch_tokens'] is not None:
                 patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
-                f = io.BytesIO()
-                np.save(f, result['patch_tokens'])
-                save_bytes(os.path.join(archive_root_dir, patch_fname), f.getvalue())
+                patch_path = os.path.join(dest, patch_fname)
+                os.makedirs(os.path.dirname(patch_path), exist_ok=True)
+                np.save(patch_path, result['patch_tokens'])
 
             label = result['label']
-            labels.append([pooled_fname, label] if label is not None else None)
+            local_labels.append([pooled_fname, label] if label is not None else None)
 
         batch_buffer.clear()
 
-    # Save metadata (only main process)
-    if accelerator.is_main_process:
-        print(f"Saving metadata for {len(labels)} features...")
+    # Wait for all processes to finish saving
+    accelerator.wait_for_everyone()
 
-        metadata = {'labels': labels if all(x is not None for x in labels) else None}
-        save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
-        close_dest()
+    # Merge labels from all processes and save metadata (only main process)
+    if accelerator.is_main_process:
+        print(f"Merging metadata from {accelerator.num_processes} processes...")
+        from accelerate.utils import gather_object
+        all_labels = gather_object(local_labels)
+
+        # Flatten list of lists
+        merged_labels = []
+        for labels_from_process in all_labels:
+            merged_labels.extend(labels_from_process)
+
+        # Sort by filename to maintain order
+        merged_labels.sort(key=lambda x: x[0] if x is not None else '')
+
+        print(f"Saving metadata for {len(merged_labels)} features...")
+
+        metadata = {'labels': merged_labels if all(x is not None for x in merged_labels) else None}
+        metadata_path = os.path.join(dest, 'dataset.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f)
 
         print(f"Encoding completed! Output saved to {dest}")
 
