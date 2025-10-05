@@ -221,13 +221,15 @@ class ImageDataset(Dataset):
 @click.option('--model-name', help='SigLIP model name from HuggingFace', metavar='STR', type=str, default='google/siglip-so400m-patch14-384')
 @click.option('--batch-size', help='Batch size per GPU for encoding', metavar='INT', type=int, default=32)
 @click.option('--save-patch-tokens', help='Save patch tokens (vision_outputs[0])', is_flag=True, default=False)
+@click.option('--metadata-only', help='Only regenerate dataset.json metadata from existing features', is_flag=True, default=False)
 def encode(
     source: str,
     dest: str,
     max_images: Optional[int],
     model_name: str,
     batch_size: int,
-    save_patch_tokens: bool
+    save_patch_tokens: bool,
+    metadata_only: bool
 ):
     """Encode images using SigLIP model with multi-GPU support via Accelerate."""
 
@@ -238,6 +240,36 @@ def encode(
     # Initialize Accelerator
     accelerator = Accelerator()
     device = accelerator.device
+
+    if metadata_only:
+        if not os.path.isdir(dest):
+            raise click.ClickException('--dest must be a directory when using --metadata-only')
+
+        if accelerator.is_main_process:
+            if os.path.isdir(source):
+                image_path_list = collect_image_paths(source, max_images=max_images)
+            else:
+                raise click.ClickException('Only directory input is supported when regenerating metadata')
+
+            merged_labels = []
+            for _, label, idx in image_path_list:
+                idx_str = f'{idx:08d}'
+                pooled_fname = f'{idx_str[:5]}/img-pooled-{idx_str}.npy'
+                pooled_path = os.path.join(dest, pooled_fname)
+                if not os.path.isfile(pooled_path):
+                    raise click.ClickException(f'Missing feature file for index {idx}: {pooled_path}')
+                merged_labels.append([pooled_fname, label] if label is not None else None)
+
+            print(f"Saving metadata for {len(merged_labels)} features...")
+            metadata = {'labels': merged_labels if all(x is not None for x in merged_labels) else None}
+            metadata_path = os.path.join(dest, 'dataset.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f)
+
+            print(f"Metadata regenerated at {metadata_path}")
+
+        accelerator.wait_for_everyone()
+        return
 
     if accelerator.is_main_process:
         print(f"Loading SigLIP model: {model_name}")
@@ -351,16 +383,18 @@ def encode(
     # Wait for all processes to finish saving
     accelerator.wait_for_everyone()
 
+    # Ensure every process participates in the gather to avoid NCCL errors
+    all_labels = accelerator.gather_object(local_labels)
+
     # Merge labels from all processes and save metadata (only main process)
     if accelerator.is_main_process:
         print(f"Merging metadata from {accelerator.num_processes} processes...")
-        from accelerate.utils import gather_object
-        all_labels = gather_object(local_labels)
 
         # Flatten list of lists
         merged_labels = []
         for labels_from_process in all_labels:
-            merged_labels.extend(labels_from_process)
+            if labels_from_process:
+                merged_labels.extend(labels_from_process)
 
         # Sort by filename to maintain order
         merged_labels.sort(key=lambda x: x[0] if x is not None else '')
