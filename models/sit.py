@@ -318,7 +318,7 @@ class SiT(nn.Module):
         x = self.x_embedder(x)   # (N, T, D), where T = H * W / patch_size ** 2
         if cls_token is not None:
             cls_token = self.cls_projectors2(cls_token)
-            cls_token = self.da(cls_token)
+            cls_token = self.wg_norm(cls_token)
             cls_token = cls_token.unsqueeze(1)  # [b, length, d]
             x = torch.cat((cls_token, x), dim=1)
             x = x + self.pos_embed

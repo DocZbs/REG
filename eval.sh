@@ -10,23 +10,23 @@ CFG_SCALE=2.3
 CLS_CFG_SCALE=2.3
 GH=0.85
 
-# export NCCL_P2P_DISABLE=1
+export NCCL_P2P_DISABLE=1
 
-# python -m torch.distributed.launch --master_port=$random_number --nproc_per_node=$NUM_GPUS generate.py \
-#   --model SiT-B/2 \
-#   --num-fid-samples 50000 \
-#   --ckpt ${SAVE_PATH}/checkpoints/${STEP}.pt \
-#   --path-type=linear \
-#   --encoder-depth=8 \
-#   --projector-embed-dims=768 \
-#   --per-proc-batch-size=64 \
-#   --mode=sde \
-#   --num-steps=${NUM_STEP} \
-#   --cfg-scale=${CFG_SCALE} \
-#   --cls-cfg-scale=${CLS_CFG_SCALE} \
-#   --guidance-high=${GH} \
-#   --sample-dir ${SAVE_PATH}/checkpoints \
-#   --cls=1152
+python -m torch.distributed.launch --master_port=$random_number --nproc_per_node=$NUM_GPUS generate.py \
+  --model SiT-B/2 \
+  --num-fid-samples 50000 \
+  --ckpt ${SAVE_PATH}/checkpoints/${STEP}.pt \
+  --path-type=linear \
+  --encoder-depth=8 \
+  --projector-embed-dims=768 \
+  --per-proc-batch-size=64 \
+  --mode=sde \
+  --num-steps=${NUM_STEP} \
+  --cfg-scale=${CFG_SCALE} \
+  --cls-cfg-scale=${CLS_CFG_SCALE} \
+  --guidance-high=${GH} \
+  --sample-dir ${SAVE_PATH}/checkpoints \
+  --cls=1152
 
 
 python ./evaluations/evaluator.py \
