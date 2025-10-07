@@ -56,7 +56,19 @@ def load_encoders(enc_type, device, resolution=256):
     enc_names = enc_type.split(',')
     encoders, architectures, encoder_types = [], [], []
     for enc_name in enc_names:
-        encoder_type, architecture, model_config = enc_name.split('-')
+        parts = enc_name.split('-')
+        if parts[0] == 'siglip':
+            if len(parts) < 2:
+                raise ValueError(f"Expected at least two components in enc_type '{enc_name}' for SigLIP.")
+            encoder_type = parts[0]
+            architecture = parts[1]
+            model_config = '-'.join(parts[2:]) if len(parts) > 2 else ''
+        else:
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Expected enc_type in the form <encoder>-<arch>-<config>, got '{enc_name}'."
+                )
+            encoder_type, architecture, model_config = parts
         # Currently, we only support 512x512 experiments with DINOv2 encoders.
         if resolution == 512:
             if encoder_type != 'dinov2':
@@ -135,7 +147,58 @@ def load_encoders(enc_type, device, resolution=256):
             encoder.embed_dim = encoder.model.transformer.width
             encoder.forward_features = encoder.forward
             encoder.eval()
-        
+
+        elif encoder_type == 'siglip':
+            from transformers import AutoModel
+
+            model_name = f"google/siglip-{architecture}"
+            if model_config:
+                model_name = f"{model_name}-{model_config}"
+
+            siglip_model = AutoModel.from_pretrained(model_name)
+            vision_model = siglip_model.vision_model.to(device)
+            vision_model.eval()
+
+            class SiglipVisionWrapper(torch.nn.Module):
+                def __init__(self, vision_model):
+                    super().__init__()
+                    self.vision = vision_model
+                    self.post_layernorm = vision_model.post_layernorm
+
+                def forward_features(self, x):
+                    outputs = self.vision(
+                        pixel_values=x,
+                        interpolate_pos_encoding=True,
+                        output_hidden_states=False,
+                        return_dict=True,
+                    )
+
+                    if hasattr(outputs, "last_hidden_state"):
+                        patch_tokens = outputs.last_hidden_state
+                    elif isinstance(outputs, (list, tuple)):
+                        patch_tokens = outputs[0]
+                    else:
+                        raise ValueError("Unexpected output structure from SigLIP vision model")
+
+                    pooled_output = None
+                    if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                        pooled_output = outputs.pooler_output
+                    elif isinstance(outputs, (list, tuple)) and len(outputs) > 1:
+                        pooled_output = outputs[1]
+
+                    if pooled_output is not None:
+                        pooled_output = self.post_layernorm(pooled_output)
+
+                    return {
+                        "patch_tokens": patch_tokens,
+                        "pooled_output": pooled_output,
+                    }
+
+            encoder = SiglipVisionWrapper(vision_model).to(device)
+            encoder.embed_dim = siglip_model.config.vision_config.hidden_size
+            encoder.eval()
+            del siglip_model
+
         elif encoder_type == 'mae':
             from models.mae_vit import vit_large_patch16
             import timm
