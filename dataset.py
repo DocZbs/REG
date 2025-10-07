@@ -11,16 +11,21 @@ try:
     import pyspng
 except ImportError:
     pyspng = None
-
+import pdb
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir):
         PIL.Image.init()
         supported_ext = PIL.Image.EXTENSION.keys() | {'.npy'}
 
-        self.images_dir = os.path.join(data_dir, 'imagenet_256_vae')
-        self.features_dir = os.path.join(data_dir, 'vae-sd-256')
-        self.siglip_dir = os.path.join(data_dir, 'imagenet_siglip')
+        self.images_dir = os.path.join(data_dir, 'imagenet_vae/imagenet_256_vae')
+        self.features_dir = os.path.join(data_dir, 'imagenet_vae/vae_256')
+        self.siglip_dir = os.path.join(data_dir, 'imagenet_siglip_256')
+
+        print(f'featuredir={self.features_dir}')
+        print(f'siglip_dir={self.siglip_dir}')
+
+        # pdb.set_trace()
 
         # images
         self._image_fnames = {
@@ -39,14 +44,26 @@ class CustomDataset(Dataset):
             fname for fname in self._feature_fnames if self._file_ext(fname) in supported_ext
             )
         # siglip_feature
-        self._siglip_fnames = {
-            os.path.relpath(os.path.join(root,fname), start=self.siglip_dir)
-            for root, _dirs, files in os.walk(self.siglip_dir) for fname in files
-        }
+        self._siglip_fnames = [
+            os.path.relpath(os.path.join(root, fname), start=self.siglip_dir)
+            for root, _dirs, files in os.walk(self.siglip_dir)
+            for fname in files if "pool" in fname
+        ]
+
 
         self.siglip_fnames = sorted(
              fname for fname in self._siglip_fnames if self._file_ext(fname) in supported_ext
         )
+        self._siglip_patches = [
+            os.path.relpath(os.path.join(root, fname), start=self.siglip_dir)
+            for root, _dirs, files in os.walk(self.siglip_dir)
+            for fname in files if "patches" in fname
+        ]
+
+        self.siglip_patches = sorted(
+             fname for fname in self._siglip_patches if self._file_ext(fname) in supported_ext
+        )
+
 
         # labels
         fname = os.path.join(self.features_dir, 'dataset.json')
@@ -75,6 +92,7 @@ class CustomDataset(Dataset):
         image_fname = self.image_fnames[idx]
         feature_fname = self.feature_fnames[idx]
         siglip_fname = self.siglip_fnames[idx]
+        siglip_patch = self.siglip_patches[idx]
         image_ext = self._file_ext(image_fname)
         with open(os.path.join(self.images_dir, image_fname), 'rb') as f:
             if image_ext == '.npy':
@@ -89,4 +107,5 @@ class CustomDataset(Dataset):
 
         features = np.load(os.path.join(self.features_dir, feature_fname))
         siglip_features =  np.load(os.path.join(self.siglip_dir, siglip_fname))
-        return torch.from_numpy(image), torch.from_numpy(features),torch.from_numpy(siglip_features), torch.tensor(self.labels[idx])
+        siglip_patch_features  = np.load(os.path.join(self.siglip_dir, siglip_patch))
+        return torch.from_numpy(image), torch.from_numpy(features),torch.from_numpy(siglip_features),torch.from_numpy(siglip_patch_features),torch.tensor(self.labels[idx])

@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import sys
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional, Tuple, Union
@@ -22,6 +23,10 @@ import numpy as np
 import PIL.Image
 import torch
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from encoders import StabilityVAEEncoder
 from utils import load_encoders
@@ -319,8 +324,8 @@ def encode(
 ):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    encoder, encoder_type, architectures = load_encoders(enc_type, device, resolution)
-    encoder, encoder_type, architectures = encoder[0], encoder_type[0], architectures[0]
+    encoders, encoder_types, architectures = load_encoders(enc_type, device, resolution)
+    encoder, encoder_type, architecture = encoders[0], encoder_types[0], architectures[0]
     print("Encoder is over!!!")
 
     """Encode pixel data to VAE latents."""
@@ -337,21 +342,51 @@ def encode(
     temp_list2 = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
         with torch.no_grad():
-            img_tensor = torch.tensor(image.img).to('cuda').permute(2, 0, 1).unsqueeze(0)
+            img_tensor = torch.tensor(image.img, device=device).permute(2, 0, 1).unsqueeze(0)
             raw_image_ = preprocess_raw_image(img_tensor, encoder_type)
-            z = encoder.forward_features(raw_image_)
-            if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
-            temp_list1.append(z)
-            z = z.detach().cpu().numpy()
-            temp_list2.append(z)
+            raw_image_ = raw_image_.to(device)
+
+            outputs = encoder.forward_features(raw_image_)
+
+            cls_tensor = None
+            features = outputs
+            if encoder_type == 'siglip':
+                cls_tensor = outputs.get('pooled_output', None)
+                features = outputs['patch_tokens']
+
+            if isinstance(features, dict):
+                if 'x_norm_patchtokens' in features:
+                    features = features['x_norm_patchtokens']
+                elif 'last_hidden_state' in features:
+                    features = features['last_hidden_state']
+            elif hasattr(features, 'last_hidden_state'):
+                features = features.last_hidden_state
+
+            temp_list1.append(features)
+
+            patch_tokens_np = features.detach().cpu().numpy()
+            temp_list2.append(patch_tokens_np)
+
+            cls_token_np = None
+            if cls_tensor is not None:
+                cls_token_np = cls_tensor.detach().cpu().numpy()
 
         idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img-feature-{idx_str}.npy'
+        patch_fname = f'{idx_str[:5]}/img-patches-{idx_str}.npy'
+        patch_path = os.path.join(archive_root_dir, patch_fname)
 
         f = io.BytesIO()
-        np.save(f, z)
-        save_bytes(os.path.join(archive_root_dir, archive_fname), f.getvalue())
-        labels.append([archive_fname, image.label] if image.label is not None else None)
+        np.save(f, patch_tokens_np)
+        save_bytes(patch_path, f.getvalue())
+
+        if cls_token_np is not None:
+            cls_fname = f'{idx_str[:5]}/img-cls-{idx_str}.npy'
+            cls_path = os.path.join(archive_root_dir, cls_fname)
+            f_cls = io.BytesIO()
+            np.save(f_cls, cls_token_np)
+            save_bytes(cls_path, f_cls.getvalue())
+
+        labels.append([patch_fname, image.label] if image.label is not None else None)
 
 
     metadata = {'labels': labels if all(x is not None for x in labels) else None}
