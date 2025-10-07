@@ -27,8 +27,11 @@ from encoders import StabilityVAEEncoder
 from utils import load_encoders
 from torchvision.transforms import Normalize
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
+SIGLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
+SIGLIP_DEFAULT_STD = (0.26862954, 0.26130258, 0.27577711)
 
 def preprocess_raw_image(x, enc_type):
     resolution = x.shape[-1]
@@ -36,6 +39,15 @@ def preprocess_raw_image(x, enc_type):
         x = x / 255.
         x = torch.nn.functional.interpolate(x, 224 * (resolution // 256), mode='bicubic')
         x = Normalize(CLIP_DEFAULT_MEAN, CLIP_DEFAULT_STD)(x)
+    elif 'siglip' in enc_type:
+        x = x / 255.
+        x = torch.nn.functional.interpolate(
+            x,
+            size=224,
+            mode='bicubic',
+            align_corners=False,
+        )
+        x = Normalize(SIGLIP_DEFAULT_MEAN, SIGLIP_DEFAULT_STD)(x)
     elif 'mocov3' in enc_type or 'mae' in enc_type:
         x = x / 255.
         x = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)(x)
