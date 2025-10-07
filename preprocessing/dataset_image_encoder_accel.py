@@ -21,6 +21,7 @@ import numpy as np
 import PIL.Image
 import torch
 from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -162,8 +163,11 @@ def main(
         samples = None
 
     obj_list = [samples]
-    accelerator.broadcast_object_list(obj_list)
+    broadcast_object_list(obj_list)
     samples = obj_list[0]
+
+    if samples is None:
+        raise RuntimeError('Failed to share sample list across processes.')
     assert samples is not None, 'Failed to broadcast samples list.'
 
     dataset = ImageTensorDataset(samples)
